@@ -1,0 +1,287 @@
+// OpsFlow - Prisma Schema
+// Operational Work Management Platform
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgvector(map: "vector", schema: "public")]
+}
+
+// ============================================
+// USERS & AUTHENTICATION
+// ============================================
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  displayName  String   @map("display_name")
+  avatarUrl    String?  @map("avatar_url")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  teamMemberships TeamMember[]
+  createdItems    WorkItem[]      @relation("CreatedBy")
+  assignedItems   WorkItem[]      @relation("AssignedTo")
+  comments        Comment[]
+  activityLogs    ActivityLog[]
+  notifications   Notification[]
+
+  @@map("users")
+}
+
+// ============================================
+// TEAMS & MEMBERSHIP
+// ============================================
+
+model Team {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  slug        String   @unique
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  members   TeamMember[]
+  workItems WorkItem[]
+
+  @@map("teams")
+}
+
+enum TeamRole {
+  ADMIN
+  TEAM_LEAD
+  MEMBER
+  VIEWER
+}
+
+model TeamMember {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  teamId    String   @map("team_id")
+  role      TeamRole @default(MEMBER)
+  joinedAt  DateTime @default(now()) @map("joined_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, teamId])
+  @@map("team_members")
+}
+
+// ============================================
+// WORK ITEMS (Core Entity)
+// ============================================
+
+enum WorkItemType {
+  INCIDENT
+  CUSTOMER_ISSUE
+  TASK
+  INVESTIGATION
+  COMPLIANCE
+  APPROVAL
+}
+
+enum WorkItemStatus {
+  OPEN
+  IN_PROGRESS
+  UNDER_REVIEW
+  BLOCKED
+  RESOLVED
+  CLOSED
+  REOPENED
+}
+
+enum WorkItemPriority {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+model WorkItem {
+  id          String           @id @default(uuid())
+  identifier  String           @unique // Human-readable ID like "OPS-1234"
+  title       String
+  description String
+  type        WorkItemType     @default(TASK)
+  status      WorkItemStatus   @default(OPEN)
+  priority    WorkItemPriority @default(MEDIUM)
+
+  // Ownership
+  teamId     String  @map("team_id")
+  createdById String  @map("created_by_id")
+  assignedToId String? @map("assigned_to_id")
+
+  // Concurrency control
+  version Int @default(1) // Optimistic concurrency version field
+
+  // Idempotency
+  idempotencyKey String? @unique @map("idempotency_key")
+
+  // AI Suggestions
+  aiSuggestions  Json?   @map("ai_suggestions") // Stores AI triage results
+  aiSummary      String? @map("ai_summary")     // Cached AI summary
+
+  // Embedding for semantic search (pgvector)
+  // Stored as raw float array, queried via raw SQL
+  embeddingUpdatedAt DateTime? @map("embedding_updated_at")
+
+  // Dates
+  dueDate    DateTime? @map("due_date")
+  resolvedAt DateTime? @map("resolved_at")
+  closedAt   DateTime? @map("closed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  team       Team     @relation(fields: [teamId], references: [id])
+  createdBy  User     @relation("CreatedBy", fields: [createdById], references: [id])
+  assignedTo User?    @relation("AssignedTo", fields: [assignedToId], references: [id])
+  comments   Comment[]
+  activityLogs ActivityLog[]
+  tags       WorkItemTag[]
+
+  @@index([teamId, status])
+  @@index([assignedToId, status])
+  @@index([createdById])
+  @@index([priority, status])
+  @@index([createdAt])
+  @@index([status, updatedAt])
+  @@map("work_items")
+}
+
+// ============================================
+// TAGS
+// ============================================
+
+model Tag {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  color     String   @default("#6B7280")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  workItems WorkItemTag[]
+
+  @@map("tags")
+}
+
+model WorkItemTag {
+  workItemId String @map("work_item_id")
+  tagId      String @map("tag_id")
+
+  workItem WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  tag      Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([workItemId, tagId])
+  @@map("work_item_tags")
+}
+
+// ============================================
+// COLLABORATION
+// ============================================
+
+model Comment {
+  id        String   @id @default(uuid())
+  content   String
+  authorId  String   @map("author_id")
+  workItemId String  @map("work_item_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  author   User     @relation(fields: [authorId], references: [id])
+  workItem WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+
+  @@index([workItemId, createdAt])
+  @@map("comments")
+}
+
+// ============================================
+// AUDIT TRAIL (Event Sourcing-inspired)
+// ============================================
+
+enum ActivityAction {
+  CREATED
+  UPDATED
+  STATUS_CHANGED
+  PRIORITY_CHANGED
+  ASSIGNED
+  UNASSIGNED
+  REASSIGNED
+  COMMENTED
+  TYPE_CHANGED
+  TAG_ADDED
+  TAG_REMOVED
+  RESOLVED
+  CLOSED
+  REOPENED
+  AI_TRIAGED
+  AI_SUGGESTION_ACCEPTED
+  AI_SUGGESTION_DISMISSED
+}
+
+model ActivityLog {
+  id         String         @id @default(uuid())
+  action     ActivityAction
+  workItemId String         @map("work_item_id")
+  userId     String         @map("user_id")
+
+  // What changed
+  fieldName  String?        @map("field_name")  // e.g., "status", "priority", "assignedTo"
+  oldValue   String?        @map("old_value")
+  newValue   String?        @map("new_value")
+  metadata   Json?          // Additional context
+
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  workItem WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id])
+
+  @@index([workItemId, createdAt])
+  @@index([userId, createdAt])
+  @@map("activity_logs")
+}
+
+// ============================================
+// NOTIFICATIONS
+// ============================================
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  title     String
+  message   String
+  type      String   // "assignment", "status_change", "comment", "ai_triage", "sla_warning"
+  link      String?  // Deep link to relevant work item
+  isRead    Boolean  @default(false) @map("is_read")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead, createdAt])
+  @@map("notifications")
+}
+
+// ============================================
+// IDEMPOTENCY TRACKING
+// ============================================
+
+model IdempotencyRecord {
+  key        String   @id
+  response   Json     // Cached response
+  statusCode Int      @map("status_code")
+  createdAt  DateTime @default(now()) @map("created_at")
+  expiresAt  DateTime @map("expires_at")
+
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}
